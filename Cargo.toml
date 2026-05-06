@@ -1,0 +1,31 @@
+[package]
+name = "chunker"
+version = "0.1.1"
+edition = "2024"
+authors = ["Devon Tomlin"]
+description = "Cross-platform CDN content chunker — chunk + publish versioned content to S3-compatible storage"
+license = "MIT"
+repository = "https://github.com/Gondola-Bros-Entertainment/chunker"
+readme = "README.md"
+keywords = ["cdn", "chunker", "s3", "r2", "content-delivery"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+aws-config = "1"
+aws-sdk-s3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+walkdir = "2"
+chrono = "0.4"
+anyhow = "1"
+indicatif = "0.17"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+strip = true

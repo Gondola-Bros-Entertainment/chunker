@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch: {}
+
+# Each matrix job builds + uploads its binary directly to the GitHub
+# Release. Skipping `actions/upload-artifact` entirely so we don't touch
+# the Actions artifact-storage quota — Releases live in a different
+# storage pool that's unaffected by the matrix-handoff quota gotcha.
+#
+# Trimmed to linux + windows; macOS local builds are 60s on Apple
+# Silicon (`cargo build --release`) so a CI matrix slot at 10× billing
+# multiplier per macOS minute isn't worth it. Re-add if a downstream
+# consumer ever needs a downloadable Mac binary.
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: chunker-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: chunker-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/chunker"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            src="${src}.exe"
+          fi
+          cp "$src" "${{ matrix.asset }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
