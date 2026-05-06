@@ -3,8 +3,8 @@
 //! Three subcommands:
 //!
 //! - `chunk`   — produce content-addressed chunks + manifest from a directory
-//! - `publish` — upload a chunk dir + manifest to S3-compatible storage,
-//!   then atomically flip `latest.txt`
+//! - `publish` — upload a chunk dir + manifest, verify the manifest is
+//!   observable, then flip `latest.txt`
 //! - `release` — one-shot of `chunk` + `publish`
 //!
 //! Chunk hashes are SHA-256 of the **uncompressed** bytes; the on-disk
@@ -64,9 +64,8 @@ struct ChunkArgs {
     /// Chunk size in bytes (default 4 MiB).
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: u64,
-    /// zstd compression level (default 12 — sweet spot per upstream JS
-    /// chunker; level 19 was overkill, builds took forever for ~5%
-    /// smaller).
+    /// zstd compression level (default 12 — speed/ratio sweet spot;
+    /// level 19 is ~5% smaller but ~10× slower).
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
 }

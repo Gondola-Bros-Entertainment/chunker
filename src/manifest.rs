@@ -1,7 +1,7 @@
-//! Manifest schema. Byte-compatible with the JS chunker the launcher
-//! consumes (`chunk-generator.js`); field names match exactly so existing
-//! 1.0.x manifests stay readable and new manifests stay parseable by
-//! existing launcher binaries.
+//! Manifest schema. JSON shape is stable: field names use the exact
+//! camelCase a JavaScript downloader would expect (`gameId`,
+//! `generatedAt`, `chunkSize`, `totalSize`, `compressedSize`), so any
+//! consumer parsing it can stay generic.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

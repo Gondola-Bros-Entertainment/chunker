@@ -2,7 +2,8 @@
 
 Cross-platform CDN content chunker. Splits a directory of files into
 content-addressed, zstd-compressed chunks; emits a JSON manifest; publishes
-chunks + manifest to S3-compatible storage with an atomic-ish version flip.
+chunks + manifest to S3-compatible storage and flips a version pointer
+**only after** verifying the manifest is observable.
 
 Designed for game/app content distribution where:
 
@@ -89,7 +90,7 @@ After `chunker publish` to bucket `B` with prefix `P`:
 B/
 ├── P/versions/<version>/manifest.json   (immutable per release)
 ├── P/chunks/<sha256>.zst                (shared content-addressed pool)
-└── P/latest.txt                         (rewritten last — atomic-ish flip)
+└── P/latest.txt                         (flipped last, after HEAD-verifying the manifest landed)
 ```
 
 ## Manifest format

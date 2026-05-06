@@ -1,9 +1,12 @@
 //! Publish a previously-chunked output dir to S3-compatible storage.
-//! Uploads chunks first (concurrent), then the per-version manifest, then
-//! flips `latest.txt` last so a partial upload never strands clients on a
-//! version they can't fully resolve.
+//!
+//! Order is: chunks (concurrent), then per-version manifest, then
+//! verify-manifest-landed via HEAD, then flip `latest.txt`. Any failure
+//! before the flip leaves the previous `latest.txt` value intact, so
+//! readers always see a self-consistent (chunks + manifest + pointer)
+//! tuple — never a pointer to a manifest or chunks that don't exist.
 
-use crate::r2::{NO_CACHE, build_client, put_file, put_string};
+use crate::r2::{NO_CACHE, build_client, object_exists, put_file, put_string};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use futures::stream::{self, StreamExt};
@@ -50,6 +53,16 @@ pub async fn publish(opts: &PublishOpts) -> Result<()> {
     let manifest_key = format!("{}/versions/{}/manifest.json", opts.prefix, opts.version);
     println!("uploading manifest → {}/{manifest_key}", opts.bucket);
     put_file(&client, &opts.bucket, &opts.manifest_path, &manifest_key).await?;
+
+    // Verify manifest is observable via HEAD before flipping the pointer.
+    // Belt-and-suspenders: PUT returned success, but if a transparent
+    // retry / replication anomaly meant readers can't see it yet, flipping
+    // latest.txt now would point at a 404. Refuse to flip in that case.
+    if !object_exists(&client, &opts.bucket, &manifest_key).await? {
+        return Err(anyhow!(
+            "manifest upload reported success but HEAD {manifest_key} returned 404; refusing to flip latest.txt"
+        ));
+    }
 
     let latest_key = format!("{}/latest.txt", opts.prefix);
     println!("flipping {}/{latest_key} → {}", opts.bucket, opts.version);

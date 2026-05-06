@@ -6,6 +6,8 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
@@ -76,6 +78,19 @@ pub async fn put_file(client: &Client, bucket: &str, local: &Path, key: &str) ->
         .await
         .with_context(|| format!("PUT {key}"))?;
     Ok(())
+}
+
+/// Returns `true` when the object exists at `<bucket>/<key>`, `false` if
+/// it does not. Used by the publish flow to verify the manifest landed
+/// before flipping the version pointer.
+pub async fn object_exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(_) => Ok(true),
+        Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+            Ok(false)
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!("HEAD {key}"))),
+    }
 }
 
 /// Upload a small in-memory string. Used for `latest.txt`, which gets a

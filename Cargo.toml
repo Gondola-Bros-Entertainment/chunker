@@ -2,7 +2,6 @@
 name = "chunker"
 version = "0.1.1"
 edition = "2024"
-authors = ["Devon Tomlin"]
 description = "Cross-platform CDN content chunker — chunk + publish versioned content to S3-compatible storage"
 license = "MIT"
 repository = "https://github.com/Gondola-Bros-Entertainment/chunker"
