@@ -3,7 +3,7 @@
 //! AWS env (`AWS_ENDPOINT_URL`, `AWS_REGION`, etc.) so the same binary
 //! can publish to any S3-compatible target.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::error::SdkError;
@@ -103,11 +103,33 @@ pub async fn put_string(
     content_type: &str,
     cache_control: &str,
 ) -> Result<()> {
+    put_bytes(
+        client,
+        bucket,
+        body.as_bytes().to_vec(),
+        key,
+        content_type,
+        cache_control,
+    )
+    .await
+}
+
+/// Upload arbitrary in-memory bytes. The fundamental put used by
+/// [`put_string`] and by [`crate::patch`] for newly-produced zstd
+/// chunks that never touch disk.
+pub async fn put_bytes(
+    client: &Client,
+    bucket: &str,
+    body: Vec<u8>,
+    key: &str,
+    content_type: &str,
+    cache_control: &str,
+) -> Result<()> {
     client
         .put_object()
         .bucket(bucket)
         .key(key)
-        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .body(ByteStream::from(body))
         .content_type(content_type)
         .cache_control(cache_control)
         .send()
@@ -116,8 +138,51 @@ pub async fn put_string(
     Ok(())
 }
 
-const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+/// Fetch an object's bytes into memory. Used by [`crate::patch`] to pull
+/// the base manifest and the prior `latest.txt`. The size cap below is
+/// defensive: every object this is called for is JSON or a tiny text
+/// pointer; if something pushed a multi-GB manifest we'd rather fail
+/// loud than blow up RAM.
+pub async fn get_object_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .with_context(|| format!("GET {key}"))?;
+
+    let content_length: i64 = response.content_length().unwrap_or(0);
+    if content_length > MAX_FETCH_BYTES as i64 {
+        return Err(anyhow!(
+            "object {key} is {content_length} bytes; refusing to load (cap {MAX_FETCH_BYTES})"
+        ));
+    }
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .with_context(|| format!("read body of {key}"))?
+        .into_bytes()
+        .to_vec();
+    Ok(bytes)
+}
+
+/// Long-lived immutable cache directive. Used for content-addressed
+/// chunks (whose contents are immutable by definition) and per-version
+/// manifests (which are immutable per release). `pub` because
+/// `crate::patch` uploads chunks in-memory and needs the same directive.
+pub const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// No-cache directive applied to `latest.txt` so launchers see the
+/// version flip immediately rather than re-reading a stale pointer.
 pub const NO_CACHE: &str = "public, max-age=0, must-revalidate";
+
+/// 64 MiB cap on in-memory fetches. JSON manifests are typically a few
+/// MB even for multi-GB content trees; this leaves a generous margin
+/// while still being a hard ceiling against runaway downloads.
+const MAX_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 
 fn content_type_for(path: &Path) -> &'static str {
     match path

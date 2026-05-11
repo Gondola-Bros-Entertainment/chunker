@@ -1,11 +1,13 @@
 //! `chunker` — cross-platform CDN content chunker. CLI entry point.
 //!
-//! Three subcommands:
+//! Four subcommands:
 //!
 //! - `chunk`   — produce content-addressed chunks + manifest from a directory
 //! - `publish` — upload a chunk dir + manifest, verify the manifest is
 //!   observable, then flip `latest.txt`
 //! - `release` — one-shot of `chunk` + `publish`
+//! - `patch`   — incrementally republish from a base version with a small
+//!   set of file overrides or removes; no full tree required locally
 //!
 //! Chunk hashes are SHA-256 of the **uncompressed** bytes; the on-disk
 //! `<hash>.zst` is the zstd-level-12 compression of those same bytes. The
@@ -15,6 +17,7 @@
 
 mod chunk;
 mod manifest;
+mod patch;
 mod publish;
 mod r2;
 
@@ -40,6 +43,11 @@ enum Cmd {
     Publish(PublishArgs),
     /// Chunk + publish in one pass.
     Release(ReleaseArgs),
+    /// Patch a published version with a small set of overrides /
+    /// removals. Starts from a base manifest in R2 instead of walking
+    /// a local tree, so single-file edits do not require the full
+    /// content tree on the runner.
+    Patch(PatchArgs),
 }
 
 #[derive(clap::Args)]
@@ -127,6 +135,77 @@ struct ReleaseArgs {
     work_dir: Option<PathBuf>,
 }
 
+#[derive(clap::Args)]
+struct PatchArgs {
+    /// Target bucket (must contain the prior version's manifest + the
+    /// shared chunk pool).
+    #[arg(long)]
+    bucket: String,
+    /// Top-level prefix inside the bucket (e.g. `client`).
+    #[arg(long)]
+    prefix: String,
+    /// Explicit base version to patch from. When omitted, the current
+    /// `<prefix>/latest.txt` value is used.
+    #[arg(long)]
+    base_version: Option<String>,
+    /// Version string written into the new manifest and into
+    /// `latest.txt` after the publish succeeds.
+    #[arg(long)]
+    version: String,
+    /// File replacement: `<manifest-path>=<local-file>`. Repeatable.
+    /// The local file is chunked at the same `--chunk-size` as the base
+    /// manifest; new chunks land in the shared pool, existing chunks
+    /// are skipped via HEAD check. The manifest path uses forward
+    /// slashes and is relative to the content root (the same form
+    /// stored in `manifest.files`).
+    #[arg(long = "override", value_parser = parse_override)]
+    overrides: Vec<patch::Override>,
+    /// Manifest-relative path to remove from the new version.
+    /// Repeatable. Must already be present in the base manifest.
+    #[arg(long = "remove")]
+    removes: Vec<String>,
+    /// Chunk size in bytes (default 4 MiB). Must match the base
+    /// manifest's chunk size — different sizes produce different chunk
+    /// boundaries and would not share the chunk pool.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: u64,
+    /// zstd compression level (default 12).
+    #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
+    zstd_level: i32,
+    /// Concurrent chunk uploads (default 16).
+    #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
+    concurrency: usize,
+    /// Overwrite the target version manifest if it already exists in
+    /// R2. Without this flag, a duplicate version is a fail-loud abort.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    /// Proceed even when `--base-version` disagrees with the current
+    /// `latest.txt`. Default refuses to publish in that case, on the
+    /// assumption that the disagreement is a race the caller did not
+    /// intend (someone else published since you fetched the base).
+    #[arg(long, default_value_t = false)]
+    allow_stale_base: bool,
+}
+
+fn parse_override(spec: &str) -> Result<patch::Override, String> {
+    let Some((path, local)) = spec.split_once('=') else {
+        return Err(format!(
+            "expected MANIFEST_PATH=LOCAL_FILE (no `=` found): {spec}"
+        ));
+    };
+    let path = path.trim();
+    let local = local.trim();
+    if path.is_empty() || local.is_empty() {
+        return Err(format!(
+            "MANIFEST_PATH and LOCAL_FILE must both be non-empty: {spec}"
+        ));
+    }
+    Ok(patch::Override {
+        path: path.to_string(),
+        local: PathBuf::from(local),
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -134,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Chunk(args) => run_chunk(args),
         Cmd::Publish(args) => run_publish(args).await,
         Cmd::Release(args) => run_release(args).await,
+        Cmd::Patch(args) => run_patch(args).await,
     }
 }
 
@@ -189,6 +269,23 @@ async fn run_release(args: ReleaseArgs) -> anyhow::Result<()> {
         bucket: args.bucket,
         prefix: args.prefix,
         concurrency: args.concurrency,
+    })
+    .await
+}
+
+async fn run_patch(args: PatchArgs) -> anyhow::Result<()> {
+    patch::patch(&patch::PatchOpts {
+        bucket: args.bucket,
+        prefix: args.prefix,
+        base_version: args.base_version,
+        new_version: args.version,
+        overrides: args.overrides,
+        removes: args.removes,
+        chunk_size: args.chunk_size,
+        zstd_level: args.zstd_level,
+        concurrency: args.concurrency,
+        force: args.force,
+        allow_stale_base: args.allow_stale_base,
     })
     .await
 }

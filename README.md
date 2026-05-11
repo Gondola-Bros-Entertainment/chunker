@@ -32,8 +32,9 @@ cargo install --path .
 
 ## Usage
 
-Three subcommands. Each one composable; `release` is a one-shot of `chunk`
-+ `publish`.
+Four subcommands. `chunk` / `publish` / `release` walk a local content
+tree; `patch` re-publishes from a base manifest in R2 without touching
+the full tree.
 
 ```bash
 # Chunk a directory locally.
@@ -59,7 +60,72 @@ chunker release \
   --platform win \
   --bucket my-content-bucket \
   --prefix client
+
+# Patch a published version with a small set of file changes — no
+# local tree required, only the changed files themselves.
+chunker patch \
+  --bucket my-content-bucket \
+  --prefix client \
+  --version 1.0.3 \
+  --override resmap/field/Hub/Hub.shbd=/tmp/Hub.shbd \
+  --override 9Data/Shine/ClassName.shn=/tmp/ClassName.shn \
+  --remove resmap/field/Old/Old.shbd
 ```
+
+### When to use `patch`
+
+`release` re-hashes the entire content tree on every publish, which
+requires the full tree (multi-GB for game content) on the runner. For
+the common case of a tiny edit — one row in a data file, one map
+binary, one script — the cost is wildly disproportionate to the change.
+
+`patch` starts from the previously-published manifest in R2 instead.
+Override files are chunked locally, deltas land in the shared pool,
+and a new manifest is composed by overlaying the changes onto the
+base. The full tree never has to exist locally; the runner only needs
+the override files themselves.
+
+Output is byte-equivalent to what a full re-chunk would have produced
+had its input tree contained the same overlaid state.
+
+#### Safety discipline
+
+- `latest.txt` is read at start and compared to `--base-version` (or
+  used as the implicit base). A mismatch aborts the patch — pass
+  `--allow-stale-base` to override if you genuinely want a stale-base
+  fork.
+- Refuses to publish over an existing target-version manifest unless
+  `--force` is set.
+- `--chunk-size` is validated against the base manifest's chunk size;
+  patches across different chunk sizes are rejected (they would not
+  share chunk boundaries with the existing pool).
+- Override paths and removal paths are validated locally before any
+  network call. Local file existence is checked up front. Failing
+  before opening the S3 client keeps half-applied state off the table.
+- Chunks are uploaded first, then the new manifest, then `latest.txt`
+  flips last — and only after a HEAD confirms the manifest is
+  observable. Any failure before the flip leaves the previous
+  `latest.txt` value intact.
+
+#### `--override` syntax
+
+`--override MANIFEST_PATH=LOCAL_FILE`, repeatable. The manifest path
+is exactly the key as it appears in `manifest.files` — forward
+slashes, no leading slash, relative to the content root. Example:
+`resmap/field/Hub/Hub.shbd=/tmp/Hub.shbd` replaces the chunks for
+`resmap/field/Hub/Hub.shbd` in the new manifest with the chunks of
+`/tmp/Hub.shbd`.
+
+Adding an entirely new file (no entry in the base) works the same
+way — the path is inserted rather than replaced.
+
+#### `--remove` syntax
+
+`--remove MANIFEST_PATH`, repeatable. The path must already exist in
+the base manifest (otherwise the patch aborts before any network
+calls). Removed paths are dropped from the new manifest's `files`
+map; their chunks stay in the shared pool but are pruned from this
+manifest's `chunks` index if no other file references them.
 
 ## Environment
 

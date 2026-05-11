@@ -1,6 +1,6 @@
 [package]
 name = "chunker"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Cross-platform CDN content chunker — chunk + publish versioned content to S3-compatible storage"
 license = "MIT"

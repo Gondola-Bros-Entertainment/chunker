@@ -6,6 +6,10 @@
 //! `chunk_size` regardless of input tree size — required because game
 //! clients can run multi-GB across tens of thousands of files and we'd
 //! OOM otherwise.
+//!
+//! The per-file streaming primitive ([`for_each_chunk`]) is re-used by
+//! [`crate::patch`] so single-file patches and full-tree releases share
+//! identical hashing + chunk-boundary semantics.
 
 use crate::manifest::{ChunkEntry, FileEntry, Manifest};
 use anyhow::{Context, Result};
@@ -14,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, create_dir_all, write};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -26,6 +30,49 @@ pub struct ChunkOpts {
     pub platform: String,
     pub chunk_size: u64,
     pub zstd_level: i32,
+}
+
+/// Stream a single file in `chunk_size`-byte pieces and invoke `on_chunk`
+/// for each piece with `(hash, uncompressed_bytes)`. Returns the file's
+/// total size and the ordered list of chunk hashes. Memory usage is
+/// bounded at one chunk regardless of file size; callers that need to
+/// process huge files should rely on this property rather than buffering
+/// the whole file.
+///
+/// Compression is deliberately *not* performed here — the caller decides
+/// whether each chunk is new (and therefore worth compressing) or already
+/// known (and therefore skippable). The full-tree [`chunk`] path uses a
+/// local seen-set; the [`crate::patch`] path uses the base manifest +
+/// optional HEAD checks.
+pub fn for_each_chunk<F>(
+    path: &Path,
+    chunk_size: u64,
+    mut on_chunk: F,
+) -> Result<(u64, Vec<String>)>
+where
+    F: FnMut(&str, &[u8]) -> Result<()>,
+{
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("metadata for {}", path.display()))?;
+    let file_size = metadata.len();
+
+    let mut buffer = vec![0u8; chunk_size as usize];
+    let mut hashes: Vec<String> = Vec::new();
+    let mut remaining = file_size;
+    while remaining > 0 {
+        let to_read = std::cmp::min(remaining as usize, chunk_size as usize);
+        let buf = &mut buffer[..to_read];
+        file.read_exact(buf)
+            .with_context(|| format!("read chunk from {}", path.display()))?;
+
+        let hash = hex::encode(Sha256::digest(&*buf));
+        on_chunk(&hash, buf)?;
+        hashes.push(hash);
+        remaining -= to_read as u64;
+    }
+    Ok((file_size, hashes))
 }
 
 pub fn chunk(opts: &ChunkOpts) -> Result<()> {
@@ -58,7 +105,6 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
     let mut file_entries: BTreeMap<String, FileEntry> = BTreeMap::new();
     let mut chunk_entries: BTreeMap<String, ChunkEntry> = BTreeMap::new();
     let mut compressed_total: u64 = 0;
-    let mut buffer = vec![0u8; opts.chunk_size as usize];
     let mut written: HashSet<String> = HashSet::new();
 
     for path in &files {
@@ -68,43 +114,29 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
             .to_str()
             .with_context(|| format!("non-UTF-8 path: {}", path.display()))?
             .replace('\\', "/");
-        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("metadata for {}", path.display()))?;
-        let file_size = metadata.len();
+
+        let (file_size, chunk_hashes) =
+            for_each_chunk(path, opts.chunk_size, |hash, uncompressed| {
+                if written.insert(hash.to_string()) {
+                    let compressed = zstd::encode_all(uncompressed, opts.zstd_level)
+                        .with_context(|| format!("zstd-compress chunk {hash}"))?;
+                    let chunk_path = chunks_dir.join(format!("{hash}.zst"));
+                    write(&chunk_path, &compressed)
+                        .with_context(|| format!("write chunk {}", chunk_path.display()))?;
+                    compressed_total += compressed.len() as u64;
+                    chunk_entries.insert(
+                        hash.to_string(),
+                        ChunkEntry {
+                            size: uncompressed.len() as u64,
+                            compressed_size: compressed.len() as u64,
+                            url: format!("../../chunks/{hash}.zst"),
+                        },
+                    );
+                }
+                Ok(())
+            })?;
+
         total_size += file_size;
-
-        let mut chunk_hashes: Vec<String> = Vec::new();
-        let mut remaining = file_size;
-        while remaining > 0 {
-            let to_read = std::cmp::min(remaining as usize, opts.chunk_size as usize);
-            let buf = &mut buffer[..to_read];
-            file.read_exact(buf)
-                .with_context(|| format!("read chunk from {}", path.display()))?;
-
-            let hash = hex::encode(Sha256::digest(&*buf));
-            chunk_hashes.push(hash.clone());
-
-            if written.insert(hash.clone()) {
-                let compressed = zstd::encode_all(&buf[..], opts.zstd_level)
-                    .with_context(|| format!("zstd-compress chunk {hash}"))?;
-                let chunk_path = chunks_dir.join(format!("{hash}.zst"));
-                write(&chunk_path, &compressed)
-                    .with_context(|| format!("write chunk {}", chunk_path.display()))?;
-                compressed_total += compressed.len() as u64;
-                chunk_entries.insert(
-                    hash.clone(),
-                    ChunkEntry {
-                        size: to_read as u64,
-                        compressed_size: compressed.len() as u64,
-                        url: format!("../../chunks/{hash}.zst"),
-                    },
-                );
-            }
-            remaining -= to_read as u64;
-        }
-
         file_entries.insert(
             rel_path,
             FileEntry {
@@ -183,6 +215,6 @@ fn is_junk_file(name: &std::ffi::OsStr) -> bool {
 
 /// ISO 8601 UTC, millisecond precision, `Z` suffix — matches the JS
 /// `Date.prototype.toISOString` output the launcher's downloader expects.
-fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
