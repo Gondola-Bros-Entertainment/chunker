@@ -52,7 +52,7 @@ Duplicate paths and overlapping overrides/removals are rejected.
 
 Chunk size defaults to 4 MiB; zstd level defaults to 12. `--chunk-size` accepts
 1 byte through 64 MiB. Patches must use the base manifest's chunk size. Upload
-concurrency defaults to 16 and accepts 1–64. New patch chunks are staged in a
+concurrency defaults to 16 and accepts 1 to 64. New patch chunks are staged in a
 temporary directory, so their compressed contents do not all stay in memory.
 `release` removes its automatically created working directory on success or
 failure; a supplied `--work-dir` is retained.
