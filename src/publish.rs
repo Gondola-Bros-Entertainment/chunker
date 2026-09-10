@@ -1,20 +1,13 @@
-//! Publish a previously-chunked output dir to S3-compatible storage.
-//!
-//! Order is: chunks (concurrent), then per-version manifest, then
-//! verify-manifest-landed via HEAD, then flip `latest.txt`. Any failure
-//! before the flip leaves the previous `latest.txt` value intact, so
-//! readers always see a self-consistent (chunks + manifest + pointer)
-//! tuple — never a pointer to a manifest or chunks that don't exist.
-
-use crate::r2::{NO_CACHE, build_client, object_exists, put_file, put_string};
-use anyhow::{Context, Result, anyhow};
+//! Validate local content first, then publish immutable objects and compare-and-swap the pointer.
+use crate::{
+    manifest::{ChunkEntry, Manifest},
+    r2::{self, Condition, IMMUTABLE_CACHE, NO_CACHE, Object},
+    validation,
+};
+use anyhow::{Context, Result, ensure};
 use aws_sdk_s3::Client;
-use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use walkdir::WalkDir;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use std::{collections::BTreeMap, path::PathBuf};
 
 pub struct PublishOpts {
     pub chunks_dir: PathBuf,
@@ -24,133 +17,188 @@ pub struct PublishOpts {
     pub prefix: String,
     pub concurrency: usize,
 }
+pub struct Target<'a> {
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub concurrency: usize,
+    pub manifest_condition: Condition,
+}
 
 pub async fn publish(opts: &PublishOpts) -> Result<()> {
-    if !opts.chunks_dir.exists() {
-        return Err(anyhow!(
-            "chunks dir does not exist: {}",
-            opts.chunks_dir.display()
-        ));
-    }
-    if !opts.manifest_path.exists() {
-        return Err(anyhow!(
-            "manifest does not exist: {}",
-            opts.manifest_path.display()
-        ));
-    }
-
-    let client = Arc::new(build_client().await?);
-
-    upload_chunks(
-        &client,
-        &opts.bucket,
-        &opts.chunks_dir,
-        &format!("{}/chunks", opts.prefix),
-        opts.concurrency,
-    )
-    .await?;
-
-    let manifest_key = format!("{}/versions/{}/manifest.json", opts.prefix, opts.version);
-    println!("uploading manifest → {}/{manifest_key}", opts.bucket);
-    put_file(&client, &opts.bucket, &opts.manifest_path, &manifest_key).await?;
-
-    // Verify manifest is observable via HEAD before flipping the pointer.
-    // Belt-and-suspenders: PUT returned success, but if a transparent
-    // retry / replication anomaly meant readers can't see it yet, flipping
-    // latest.txt now would point at a 404. Refuse to flip in that case.
-    if !object_exists(&client, &opts.bucket, &manifest_key).await? {
-        return Err(anyhow!(
-            "manifest upload reported success but HEAD {manifest_key} returned 404; refusing to flip latest.txt"
-        ));
-    }
-
-    let latest_key = format!("{}/latest.txt", opts.prefix);
-    println!("flipping {}/{latest_key} → {}", opts.bucket, opts.version);
-    put_string(
-        &client,
-        &opts.bucket,
-        &format!("{}\n", opts.version),
-        &latest_key,
-        "text/plain",
-        NO_CACHE,
-    )
-    .await?;
-
-    println!("publish complete: version {}", opts.version);
-    Ok(())
-}
-
-/// Concurrent upload of every file under `chunks_dir`, naming each
-/// object as `<key_prefix>/<filename>`.
-async fn upload_chunks(
-    client: &Arc<Client>,
-    bucket: &str,
-    chunks_dir: &Path,
-    key_prefix: &str,
-    concurrency: usize,
-) -> Result<()> {
-    let jobs = collect_jobs(chunks_dir, key_prefix)?;
-    let total = jobs.len();
-    if total == 0 {
-        println!("no chunks to upload");
-        return Ok(());
-    }
-
-    let pb = ProgressBar::new(total as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} chunks ({eta})",
-        )
-        .unwrap()
-        .progress_chars("█▓▒░ "),
+    validation::identifier(&opts.version)?;
+    validation::relative_path(&opts.prefix)?;
+    validation::concurrency(opts.concurrency)?;
+    let manifest = validation::parse_manifest(&validation::read_regular(
+        &opts.manifest_path,
+        validation::MAX_MANIFEST_BYTES,
+    )?)?;
+    ensure!(
+        manifest.version == opts.version,
+        "--version does not match manifest version"
     );
-    pb.enable_steady_tick(Duration::from_millis(200));
+    let mut files = BTreeMap::new();
+    for (hash, entry) in &manifest.chunks {
+        let file = opts.chunks_dir.join(format!("{hash}.zst"));
+        validation::compressed(
+            hash,
+            entry,
+            &validation::read_regular(&file, entry.compressed_size)?,
+        )?;
+        files.insert(hash.clone(), file);
+    }
+    // No network writes are possible before every source chunk has passed validation.
+    let client = r2::build_client().await?;
+    let previous = r2::get(
+        &client,
+        &opts.bucket,
+        &format!("{}/latest.txt", opts.prefix),
+        1024,
+    )
+    .await?;
+    let key = format!("{}/versions/{}/manifest.json", opts.prefix, opts.version);
+    ensure!(
+        r2::head(&client, &opts.bucket, &key).await?.is_none(),
+        "version manifest already exists; choose a new version"
+    );
+    publish_manifest(
+        &client,
+        &Target {
+            bucket: &opts.bucket,
+            prefix: &opts.prefix,
+            concurrency: opts.concurrency,
+            manifest_condition: Condition::Absent,
+        },
+        manifest,
+        files,
+        previous.as_ref(),
+    )
+    .await
+}
 
-    let pb_arc = Arc::new(pb);
-    let results = stream::iter(jobs)
-        .map(|job| {
-            let client = client.clone();
-            let bucket = bucket.to_string();
-            let pb = pb_arc.clone();
-            async move {
-                let result = put_file(&client, &bucket, &job.local, &job.key)
-                    .await
-                    .with_context(|| format!("upload {}", job.key));
-                pb.inc(1);
-                result
-            }
+async fn ensure_chunk(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    hash: &str,
+    entry: &ChunkEntry,
+    local: &std::path::Path,
+) -> Result<u64> {
+    // Validate again while reading the exact bytes used by PUT, in case local files changed.
+    let bytes = validation::read_regular(local, entry.compressed_size)?;
+    validation::compressed(hash, entry, &bytes)?;
+    if r2::head(client, bucket, key).await?.is_none()
+        && r2::put(
+            client,
+            bucket,
+            key,
+            bytes,
+            ("application/zstd", IMMUTABLE_CACHE),
+            &Condition::Absent,
+        )
+        .await?
+    {
+        return Ok(entry.compressed_size);
+    }
+    // Never overwrite the canonical compressed representation of an existing raw hash.
+    // Different zstd levels/builds may encode the same bytes differently.
+    let object = r2::get(
+        client,
+        bucket,
+        key,
+        zstd::zstd_safe::compress_bound(entry.size as usize) as u64,
+    )
+    .await?
+    .context("concurrent chunk disappeared")?;
+    let mut canonical = entry.clone();
+    canonical.compressed_size = object.bytes.len() as u64;
+    validation::compressed(hash, &canonical, &object.bytes)?;
+    Ok(canonical.compressed_size)
+}
+
+pub async fn publish_manifest(
+    client: &Client,
+    target: &Target<'_>,
+    mut manifest: Manifest,
+    files: BTreeMap<String, PathBuf>,
+    previous: Option<&Object>,
+) -> Result<()> {
+    validation::manifest(&manifest)?;
+    if let Some(old) = previous {
+        ensure!(
+            std::str::from_utf8(&old.bytes)?.trim() != manifest.version,
+            "cannot replace the active version; choose a new version"
+        );
+    }
+    let chunks = &manifest.chunks;
+    let uploaded: Vec<(String, u64)> = stream::iter(files)
+        .map(|(hash, file)| async move {
+            let entry = chunks
+                .get(&hash)
+                .context("pending chunk missing from manifest")?;
+            let size = ensure_chunk(
+                client,
+                target.bucket,
+                &format!("{}/chunks/{hash}.zst", target.prefix),
+                &hash,
+                entry,
+                &file,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((hash, size))
         })
-        .buffer_unordered(concurrency)
-        .collect::<Vec<Result<()>>>()
-        .await;
-
-    pb_arc.finish_with_message("uploaded");
-
-    for r in results {
-        r?;
+        .buffer_unordered(target.concurrency)
+        .try_collect()
+        .await?;
+    for (hash, size) in uploaded {
+        manifest.chunks.get_mut(&hash).unwrap().compressed_size = size;
     }
+    // Inherited patch chunks are trusted base content, but every reference must still exist.
+    // Clients independently verify hashes on download; patching does not download the old tree.
+    for (hash, entry) in &manifest.chunks {
+        let key = format!("{}/chunks/{hash}.zst", target.prefix);
+        let remote = r2::head(client, target.bucket, &key)
+            .await?
+            .with_context(|| format!("required chunk missing: {hash}"))?;
+        ensure!(
+            remote.size == entry.compressed_size,
+            "required chunk size changed: {hash}"
+        );
+    }
+    validation::manifest(&manifest)?;
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    ensure!(
+        bytes.len() as u64 <= validation::MAX_MANIFEST_BYTES,
+        "manifest exceeds size limit"
+    );
+    let key = format!(
+        "{}/versions/{}/manifest.json",
+        target.prefix, manifest.version
+    );
+    r2::required_put(
+        client,
+        target.bucket,
+        &key,
+        bytes.clone(),
+        ("application/json", IMMUTABLE_CACHE),
+        &target.manifest_condition,
+    )
+    .await?;
+    let visible = r2::get(client, target.bucket, &key, validation::MAX_MANIFEST_BYTES)
+        .await?
+        .context("published manifest is not observable")?;
+    ensure!(
+        visible.bytes == bytes,
+        "published manifest differs from validated bytes"
+    );
+    r2::required_put(
+        client,
+        target.bucket,
+        &format!("{}/latest.txt", target.prefix),
+        format!("{}\n", manifest.version).into_bytes(),
+        ("text/plain", NO_CACHE),
+        &Condition::previous(previous),
+    )
+    .await?;
+    println!("publish complete: version {}", manifest.version);
     Ok(())
-}
-
-struct UploadJob {
-    local: PathBuf,
-    key: String,
-}
-
-fn collect_jobs(dir: &Path, key_prefix: &str) -> Result<Vec<UploadJob>> {
-    let mut jobs = Vec::new();
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            let local = entry.path().to_path_buf();
-            let name = local
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("non-UTF-8 chunk filename: {}", local.display()))?;
-            jobs.push(UploadJob {
-                local: local.clone(),
-                key: format!("{key_prefix}/{name}"),
-            });
-        }
-    }
-    Ok(jobs)
 }

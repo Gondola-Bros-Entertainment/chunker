@@ -1,6 +1,6 @@
 [package]
 name = "chunker"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Cross-platform CDN content chunker — chunk + publish versioned content to S3-compatible storage"
 license = "MIT"
@@ -12,7 +12,6 @@ categories = ["command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
-aws-config = "1"
 aws-sdk-s3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

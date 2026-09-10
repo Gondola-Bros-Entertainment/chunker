@@ -1,18 +1,7 @@
-//! Local chunking pass: walk a directory, split each file into
-//! fixed-size pieces hashed by SHA-256, zstd-compress unique chunks, and
-//! emit a manifest.
-//!
-//! The hot path streams chunk-by-chunk so memory usage stays bounded at
-//! `chunk_size` regardless of input tree size — required because game
-//! clients can run multi-GB across tens of thousands of files and we'd
-//! OOM otherwise.
-//!
-//! The per-file streaming primitive ([`for_each_chunk`]) is re-used by
-//! [`crate::patch`] so single-file patches and full-tree releases share
-//! identical hashing + chunk-boundary semantics.
-
+//! Split regular files into SHA-256-addressed zstd chunks.
 use crate::manifest::{ChunkEntry, FileEntry, Manifest};
-use anyhow::{Context, Result};
+use crate::validation;
+use anyhow::{Context, Result, ensure};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -32,18 +21,8 @@ pub struct ChunkOpts {
     pub zstd_level: i32,
 }
 
-/// Stream a single file in `chunk_size`-byte pieces and invoke `on_chunk`
-/// for each piece with `(hash, uncompressed_bytes)`. Returns the file's
-/// total size and the ordered list of chunk hashes. Memory usage is
-/// bounded at one chunk regardless of file size; callers that need to
-/// process huge files should rely on this property rather than buffering
-/// the whole file.
-///
-/// Compression is deliberately *not* performed here — the caller decides
-/// whether each chunk is new (and therefore worth compressing) or already
-/// known (and therefore skippable). The full-tree [`chunk`] path uses a
-/// local seen-set; the [`crate::patch`] path uses the base manifest +
-/// optional HEAD checks.
+/// Read one chunk at a time and call `on_chunk` with its hash and raw bytes.
+/// Return the original file size and ordered chunk hashes. Changed files fail.
 pub fn for_each_chunk<F>(
     path: &Path,
     chunk_size: u64,
@@ -52,17 +31,19 @@ pub fn for_each_chunk<F>(
 where
     F: FnMut(&str, &[u8]) -> Result<()>,
 {
+    validation::chunk_size(chunk_size)?;
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("metadata for {}", path.display()))?;
+    ensure!(metadata.is_file(), "chunk input must be a regular file");
     let file_size = metadata.len();
 
     let mut buffer = vec![0u8; chunk_size as usize];
     let mut hashes: Vec<String> = Vec::new();
     let mut remaining = file_size;
     while remaining > 0 {
-        let to_read = std::cmp::min(remaining as usize, chunk_size as usize);
+        let to_read = remaining.min(chunk_size) as usize;
         let buf = &mut buffer[..to_read];
         file.read_exact(buf)
             .with_context(|| format!("read chunk from {}", path.display()))?;
@@ -72,11 +53,35 @@ where
         hashes.push(hash);
         remaining -= to_read as u64;
     }
+    let after = file.metadata()?;
+    let mut extra = [0];
+    ensure!(
+        file.read(&mut extra)? == 0
+            && after.len() == file_size
+            && after.modified()? == metadata.modified()?,
+        "input changed while chunking: {}",
+        path.display()
+    );
     Ok((file_size, hashes))
 }
 
 pub fn chunk(opts: &ChunkOpts) -> Result<()> {
-    let chunks_dir = opts.output.join("chunks");
+    validation::chunk_size(opts.chunk_size)?;
+    validation::identifier(&opts.version)?;
+    validation::identifier(&opts.game)?;
+    validation::identifier(&opts.platform)?;
+    let input = opts
+        .input
+        .canonicalize()
+        .context("resolve input directory")?;
+    ensure!(input.is_dir(), "input must be a directory");
+    create_dir_all(&opts.output)?;
+    let output = opts.output.canonicalize()?;
+    ensure!(
+        !output.starts_with(&input),
+        "output must be outside the input tree"
+    );
+    let chunks_dir = output.join("chunks");
     create_dir_all(&chunks_dir)
         .with_context(|| format!("create output chunks dir at {}", chunks_dir.display()))?;
 
@@ -88,7 +93,7 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
         opts.zstd_level
     );
 
-    let files = collect_files(&opts.input)?;
+    let files = collect_files(&input)?;
     println!("found {} files", files.len());
 
     let pb = ProgressBar::new(files.len() as u64);
@@ -109,11 +114,12 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
 
     for path in &files {
         let rel_path = path
-            .strip_prefix(&opts.input)
-            .with_context(|| format!("strip_prefix on {}", path.display()))?
-            .to_str()
-            .with_context(|| format!("non-UTF-8 path: {}", path.display()))?
-            .replace('\\', "/");
+            .strip_prefix(&input)?
+            .components()
+            .map(|part| part.as_os_str().to_str().context("non-UTF-8 input path"))
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
+        validation::relative_path(&rel_path)?;
 
         let (file_size, chunk_hashes) =
             for_each_chunk(path, opts.chunk_size, |hash, uncompressed| {
@@ -136,7 +142,10 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
                 Ok(())
             })?;
 
-        total_size += file_size;
+        validation::relative_path(&rel_path)?;
+        total_size = total_size
+            .checked_add(file_size)
+            .context("input total size overflow")?;
         file_entries.insert(
             rel_path,
             FileEntry {
@@ -159,7 +168,8 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
         chunks: chunk_entries,
     };
 
-    let manifest_path = opts.output.join("manifest.json");
+    validation::manifest(&manifest)?;
+    let manifest_path = output.join("manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     write(&manifest_path, manifest_json.as_bytes())
         .with_context(|| format!("write manifest to {}", manifest_path.display()))?;
@@ -178,43 +188,42 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
     Ok(())
 }
 
-/// Walk the input tree depth-first, collecting regular files in sorted
-/// order. Sorting up front keeps the chunking deterministic: same input,
-/// same chunk write order, same progress-bar narrative across runs.
-///
-/// Junk files are filtered: macOS AppleDouble shadows (`._*`),
-/// `.DS_Store`, `Thumbs.db`. Without this, a directory tar'd on macOS
-/// without `COPYFILE_DISABLE=1` doubles every entry with an `._*` shadow,
-/// bloating the manifest and shipping useless bytes to every consumer.
-/// Junk filtering belongs in the tool so a single Mac-tarred input does
-/// not poison every downstream consumer's manifest.
+/// Sort regular files for deterministic manifests. Propagate traversal errors.
 fn collect_files(root: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| !is_junk_file(entry.file_name()))
-        .map(|entry| entry.into_path())
-        .collect();
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root) {
+        let entry = entry.context("read input tree")?;
+        if is_junk_file(entry.file_name()) {
+            continue;
+        }
+        ensure!(
+            !entry.file_type().is_symlink(),
+            "input contains a symlink: {}",
+            entry.path().display()
+        );
+        if entry.file_type().is_file() {
+            paths.push(entry.into_path());
+        } else {
+            ensure!(
+                entry.file_type().is_dir(),
+                "unsupported input file: {}",
+                entry.path().display()
+            );
+        }
+    }
     paths.sort();
     Ok(paths)
 }
 
-/// File-name-only matcher (no path inspection): detects OS metadata
-/// detritus that should never be part of a content release.
 fn is_junk_file(name: &std::ffi::OsStr) -> bool {
     let Some(s) = name.to_str() else { return false };
-    // macOS AppleDouble shadow files for any underlying file `X` are
-    // named `._X`. They carry resource forks / extended attributes and
-    // are useless on any non-HFS+ consumer.
     if s.starts_with("._") {
         return true;
     }
     matches!(s, ".DS_Store" | "Thumbs.db" | "desktop.ini")
 }
 
-/// ISO 8601 UTC, millisecond precision, `Z` suffix — matches the JS
-/// `Date.prototype.toISOString` output the launcher's downloader expects.
+/// UTC timestamp with millisecond precision.
 pub fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

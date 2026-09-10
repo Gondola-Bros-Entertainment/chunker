@@ -1,25 +1,12 @@
-//! `chunker` — cross-platform CDN content chunker. CLI entry point.
-//!
-//! Four subcommands:
-//!
-//! - `chunk`   — produce content-addressed chunks + manifest from a directory
-//! - `publish` — upload a chunk dir + manifest, verify the manifest is
-//!   observable, then flip `latest.txt`
-//! - `release` — one-shot of `chunk` + `publish`
-//! - `patch`   — incrementally republish from a base version with a small
-//!   set of file overrides or removes; no full tree required locally
-//!
-//! Chunk hashes are SHA-256 of the **uncompressed** bytes; the on-disk
-//! `<hash>.zst` is the zstd-level-12 compression of those same bytes. The
-//! launcher decompresses and re-hashes on download to detect corruption,
-//! so it doesn't matter that compressed bytes can drift between zstd
-//! library versions — only the uncompressed hash is the contract.
+//! Command-line entry point for chunking, publishing and incremental patches.
 
 mod chunk;
 mod manifest;
 mod patch;
 mod publish;
 mod r2;
+mod temporary;
+mod validation;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -72,8 +59,7 @@ struct ChunkArgs {
     /// Chunk size in bytes (default 4 MiB).
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: u64,
-    /// zstd compression level (default 12 — speed/ratio sweet spot;
-    /// level 19 is ~5% smaller but ~10× slower).
+    /// zstd compression level (default 12).
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
 }
@@ -154,10 +140,8 @@ struct PatchArgs {
     version: String,
     /// File replacement: `<manifest-path>=<local-file>`. Repeatable.
     /// The local file is chunked at the same `--chunk-size` as the base
-    /// manifest; new chunks land in the shared pool, existing chunks
-    /// are skipped via HEAD check. The manifest path uses forward
-    /// slashes and is relative to the content root (the same form
-    /// stored in `manifest.files`).
+    /// manifest. Existing encodings are verified and reused. Manifest paths
+    /// use forward slashes and are relative to the content root.
     #[arg(long = "override", value_parser = parse_override)]
     overrides: Vec<patch::Override>,
     /// Manifest-relative path to remove from the new version.
@@ -175,14 +159,11 @@ struct PatchArgs {
     /// Concurrent chunk uploads (default 16).
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
-    /// Overwrite the target version manifest if it already exists in
-    /// R2. Without this flag, a duplicate version is a fail-loud abort.
-    #[arg(long, default_value_t = false)]
+    /// Retired: published versions cannot be overwritten. Use a new version.
+    #[arg(long, hide = true, default_value_t = false)]
     force: bool,
     /// Proceed even when `--base-version` disagrees with the current
-    /// `latest.txt`. Default refuses to publish in that case, on the
-    /// assumption that the disagreement is a race the caller did not
-    /// intend (someone else published since you fetched the base).
+    /// `latest.txt`. The final pointer update still rejects concurrent changes.
     #[arg(long, default_value_t = false)]
     allow_stale_base: bool,
 }
@@ -243,14 +224,17 @@ async fn run_publish(args: PublishArgs) -> anyhow::Result<()> {
 }
 
 async fn run_release(args: ReleaseArgs) -> anyhow::Result<()> {
-    let work_dir = match args.work_dir {
-        Some(p) => p,
-        None => std::env::temp_dir().join(format!(
-            "chunker-{}-{}",
-            args.game,
-            chrono::Utc::now().timestamp()
-        )),
+    validation::identifier(&args.version)?;
+    validation::relative_path(&args.prefix)?;
+    validation::concurrency(args.concurrency)?;
+    let temporary = if args.work_dir.is_none() {
+        Some(temporary::Directory::new()?)
+    } else {
+        None
     };
+    let work_dir = args
+        .work_dir
+        .unwrap_or_else(|| temporary.as_ref().unwrap().path().to_path_buf());
 
     chunk::chunk(&chunk::ChunkOpts {
         input: args.input,
