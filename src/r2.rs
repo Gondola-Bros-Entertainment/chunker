@@ -1,201 +1,145 @@
-//! S3-compatible client setup and small helpers. Defaults to Cloudflare
-//! R2 when `R2_ACCOUNT_ID` is set; otherwise falls back to the standard
-//! AWS env (`AWS_ENDPOINT_URL`, `AWS_REGION`, etc.) so the same binary
-//! can publish to any S3-compatible target.
+//! Bounded S3 reads and conditional writes. Credentials remain process-local.
+use anyhow::{Context, Result, bail, ensure};
+use aws_sdk_s3::{Client, config::Credentials, primitives::ByteStream};
 
-use anyhow::{Context, Result, anyhow};
-use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::primitives::ByteStream;
-use std::path::Path;
+pub const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+pub const NO_CACHE: &str = "public, max-age=0, must-revalidate";
 
-/// Build an S3 client wired for the configured endpoint.
-///
-/// Credential precedence:
-/// 1. `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` (explicit R2 envs)
-/// 2. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (standard AWS envs)
-///
-/// Endpoint:
-/// - `R2_ACCOUNT_ID` set → `https://<account>.r2.cloudflarestorage.com`
-/// - otherwise → `AWS_ENDPOINT_URL` (or standard region resolution)
 pub async fn build_client() -> Result<Client> {
-    let creds = resolve_credentials()?;
-    let region = aws_sdk_s3::config::Region::new(env_or("AWS_REGION", "auto"));
-
+    let first = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+    };
+    let credentials = Credentials::new(
+        first(&["R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]).context("missing S3 access key")?,
+        first(&["R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"])
+            .context("missing S3 secret key")?,
+        None,
+        None,
+        "chunker-env",
+    );
     let mut builder = aws_sdk_s3::config::Builder::new()
-        .region(region)
-        .credentials_provider(creds)
+        .region(aws_sdk_s3::config::Region::new(
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into()),
+        ))
+        .credentials_provider(credentials)
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
-
-    if let Ok(account_id) = std::env::var("R2_ACCOUNT_ID") {
-        builder = builder.endpoint_url(format!("https://{account_id}.r2.cloudflarestorage.com"));
+    if let Ok(account) = std::env::var("R2_ACCOUNT_ID") {
+        ensure!(
+            account.len() == 32 && account.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid R2 account ID"
+        );
+        builder = builder.endpoint_url(format!("https://{account}.r2.cloudflarestorage.com"));
     } else if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
         builder = builder.endpoint_url(endpoint);
     }
-
     Ok(Client::from_conf(builder.build()))
 }
 
-fn resolve_credentials() -> Result<Credentials> {
-    let access = first_non_empty(&["R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"])
-        .context("missing access key id (R2_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID)")?;
-    let secret = first_non_empty(&["R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"])
-        .context("missing secret access key (R2_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY)")?;
-    Ok(Credentials::new(access, secret, None, None, "chunker-env"))
+pub struct Object {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+}
+pub struct Metadata {
+    pub size: u64,
 }
 
-fn first_non_empty(names: &[&str]) -> Option<String> {
-    for name in names {
-        match std::env::var(name) {
-            Ok(v) if !v.is_empty() => return Some(v),
-            _ => continue,
-        }
+pub async fn get(client: &Client, bucket: &str, key: &str, limit: u64) -> Result<Option<Object>> {
+    let response = match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(r) => r,
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("GET {key}")),
+    };
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|n| n >= 0 && n as u64 <= limit),
+        "object exceeds limit: {key}"
+    );
+    let etag = response
+        .e_tag()
+        .context("S3 response has no ETag")?
+        .to_owned();
+    let mut body = response.body;
+    let mut bytes = Vec::new();
+    while let Some(part) = body.next().await {
+        let part = part?;
+        ensure!(
+            part.len() as u64 <= limit - bytes.len() as u64,
+            "object exceeds limit: {key}"
+        );
+        bytes.extend_from_slice(&part);
     }
-    None
+    Ok(Some(Object { bytes, etag }))
 }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+pub async fn head(client: &Client, bucket: &str, key: &str) -> Result<Option<Metadata>> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(r) => Ok(Some(Metadata {
+            size: r
+                .content_length()
+                .filter(|&n| n >= 0)
+                .context("S3 response has no size")? as u64,
+        })),
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("HEAD {key}")),
+    }
 }
 
-/// Upload a file with a known content type and a long-lived immutable
-/// cache directive (the default for content-addressed chunks + version
-/// manifests).
-pub async fn put_file(client: &Client, bucket: &str, local: &Path, key: &str) -> Result<()> {
-    let body = ByteStream::from_path(local)
-        .await
-        .with_context(|| format!("read {}", local.display()))?;
-    client
+#[derive(Clone)]
+pub enum Condition {
+    Absent,
+    Match(String),
+}
+impl Condition {
+    pub fn previous(value: Option<&Object>) -> Self {
+        value.map_or(Self::Absent, |v| Self::Match(v.etag.clone()))
+    }
+}
+
+// false means another writer changed the object. Never retry unconditionally.
+pub async fn put(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    bytes: Vec<u8>,
+    metadata: (&str, &str),
+    condition: &Condition,
+) -> Result<bool> {
+    let request = client
         .put_object()
         .bucket(bucket)
         .key(key)
-        .body(body)
-        .content_type(content_type_for(local))
-        .cache_control(IMMUTABLE_CACHE)
-        .send()
-        .await
-        .with_context(|| format!("PUT {key}"))?;
-    Ok(())
-}
-
-/// Returns `true` when the object exists at `<bucket>/<key>`, `false` if
-/// it does not. Used by the publish flow to verify the manifest landed
-/// before flipping the version pointer.
-pub async fn object_exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {
-    match client.head_object().bucket(bucket).key(key).send().await {
+        .body(ByteStream::from(bytes))
+        .content_type(metadata.0)
+        .cache_control(metadata.1);
+    let request = match condition {
+        Condition::Absent => request.if_none_match("*"),
+        Condition::Match(etag) => request.if_match(etag),
+    };
+    match request.send().await {
         Ok(_) => Ok(true),
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+        Err(e)
+            if e.raw_response()
+                .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+        {
             Ok(false)
         }
-        Err(e) => Err(anyhow::Error::new(e).context(format!("HEAD {key}"))),
+        Err(e) => Err(e).with_context(|| format!("conditional PUT {key}")),
     }
 }
 
-/// Upload a small in-memory string. Used for `latest.txt`, which gets a
-/// no-cache directive so launchers see the flip immediately.
-pub async fn put_string(
+pub async fn required_put(
     client: &Client,
     bucket: &str,
-    body: &str,
     key: &str,
-    content_type: &str,
-    cache_control: &str,
+    bytes: Vec<u8>,
+    metadata: (&str, &str),
+    condition: &Condition,
 ) -> Result<()> {
-    put_bytes(
-        client,
-        bucket,
-        body.as_bytes().to_vec(),
-        key,
-        content_type,
-        cache_control,
-    )
-    .await
-}
-
-/// Upload arbitrary in-memory bytes. The fundamental put used by
-/// [`put_string`] and by [`crate::patch`] for newly-produced zstd
-/// chunks that never touch disk.
-pub async fn put_bytes(
-    client: &Client,
-    bucket: &str,
-    body: Vec<u8>,
-    key: &str,
-    content_type: &str,
-    cache_control: &str,
-) -> Result<()> {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(body))
-        .content_type(content_type)
-        .cache_control(cache_control)
-        .send()
-        .await
-        .with_context(|| format!("PUT {key}"))?;
+    if !put(client, bucket, key, bytes, metadata, condition).await? {
+        bail!("concurrent publication changed {key}; refusing to overwrite it");
+    }
     Ok(())
-}
-
-/// Fetch an object's bytes into memory. Used by [`crate::patch`] to pull
-/// the base manifest and the prior `latest.txt`. The size cap below is
-/// defensive: every object this is called for is JSON or a tiny text
-/// pointer; if something pushed a multi-GB manifest we'd rather fail
-/// loud than blow up RAM.
-pub async fn get_object_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
-    let response = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .with_context(|| format!("GET {key}"))?;
-
-    let content_length: i64 = response.content_length().unwrap_or(0);
-    if content_length > MAX_FETCH_BYTES as i64 {
-        return Err(anyhow!(
-            "object {key} is {content_length} bytes; refusing to load (cap {MAX_FETCH_BYTES})"
-        ));
-    }
-
-    let bytes = response
-        .body
-        .collect()
-        .await
-        .with_context(|| format!("read body of {key}"))?
-        .into_bytes()
-        .to_vec();
-    Ok(bytes)
-}
-
-/// Long-lived immutable cache directive. Used for content-addressed
-/// chunks (whose contents are immutable by definition) and per-version
-/// manifests (which are immutable per release). `pub` because
-/// `crate::patch` uploads chunks in-memory and needs the same directive.
-pub const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
-
-/// No-cache directive applied to `latest.txt` so launchers see the
-/// version flip immediately rather than re-reading a stale pointer.
-pub const NO_CACHE: &str = "public, max-age=0, must-revalidate";
-
-/// 64 MiB cap on in-memory fetches. JSON manifests are typically a few
-/// MB even for multi-GB content trees; this leaves a generous margin
-/// while still being a hard ceiling against runaway downloads.
-const MAX_FETCH_BYTES: u64 = 64 * 1024 * 1024;
-
-fn content_type_for(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("json") => "application/json",
-        Some("yml") | Some("yaml") => "text/yaml",
-        Some("txt") => "text/plain",
-        Some("zst") => "application/zstd",
-        Some("exe") | Some("bin") => "application/octet-stream",
-        _ => "application/octet-stream",
-    }
 }

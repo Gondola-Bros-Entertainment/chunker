@@ -1,190 +1,140 @@
-# chunker
+# Chunker
 
-Cross-platform CDN content chunker. Splits a directory of files into
-content-addressed, zstd-compressed chunks; emits a JSON manifest; publishes
-chunks + manifest to S3-compatible storage and flips a version pointer
-**only after** verifying the manifest is observable.
-
-Designed for game/app content distribution where:
-
-- Releases are large (multi-GB) but each release changes only a few files.
-- Downloaders fetch only the changed chunks via a content-addressed pool.
-- Per-version manifests are immutable; a single `latest.txt` pointer flips
-  atomically when a release is ready.
+Chunker splits a directory into SHA-256-addressed, zstd-compressed chunks and
+publishes a versioned manifest to S3-compatible storage, including Cloudflare R2.
+A patch reads the previous manifest and processes only replacement files.
 
 ## Install
 
-Pre-built binaries on each release (Linux x86_64, Windows x86_64). On
-macOS: `cargo build --release` locally — Apple Silicon does it in ~60s
-and CI macOS minutes are a 10× billing multiplier not worth burning for
-this. From CI runners:
+Download an executable and its SHA-256 checksum from
+[Releases](https://github.com/Gondola-Bros-Entertainment/chunker/releases/latest):
 
-```bash
-curl -L https://github.com/Gondola-Bros-Entertainment/chunker/releases/download/v0.1.0/chunker-linux-x64 -o chunker
-chmod +x chunker
-```
+| Platform | Executable |
+| --- | --- |
+| Linux x86-64 | `chunker-linux-x64` |
+| Windows x86-64 | `chunker-windows-x64.exe` |
+| macOS Apple Silicon | `chunker-macos-arm64` |
 
-Or build from source:
+On Linux/macOS, verify the checksum, rename the executable to `chunker`, and make
+it executable with `chmod +x chunker`. The macOS executable is ad hoc signed,
+not notarized. Intel Macs can build from source.
 
-```bash
-cargo install --path .
+To build from source, install stable Rust and run:
+
+```sh
+cargo install --path . --locked
 ```
 
 ## Usage
 
-Four subcommands. `chunk` / `publish` / `release` walk a local content
-tree; `patch` re-publishes from a base manifest in R2 without touching
-the full tree.
+```sh
+# Write chunks and a manifest locally. Keep output outside the input tree.
+chunker chunk --input ./client --output ./out \
+  --version 1.0.0 --game my-game --platform win
 
-```bash
-# Chunk a directory locally.
-chunker chunk \
-  --input ./client-build \
-  --output ./out \
-  --version 1.0.2 \
-  --game my-game \
-  --platform win
+# Publish that exact version.
+chunker publish --chunks ./out --version 1.0.0 \
+  --bucket builds --prefix my-game/win
 
-# Publish a previously-chunked output dir to S3-compatible storage.
-chunker publish \
-  --chunks ./out \
-  --version 1.0.2 \
-  --bucket my-content-bucket \
-  --prefix client
+# Or chunk and publish in one command.
+chunker release --input ./client --version 1.0.1 --game my-game --platform win \
+  --bucket builds --prefix my-game/win
 
-# One-shot: chunk + publish.
-chunker release \
-  --input ./client-build \
-  --version 1.0.2 \
-  --game my-game \
-  --platform win \
-  --bucket my-content-bucket \
-  --prefix client
-
-# Patch a published version with a small set of file changes — no
-# local tree required, only the changed files themselves.
-chunker patch \
-  --bucket my-content-bucket \
-  --prefix client \
-  --version 1.0.3 \
-  --override resmap/field/Hub/Hub.shbd=/tmp/Hub.shbd \
-  --override 9Data/Shine/ClassName.shn=/tmp/ClassName.shn \
-  --remove resmap/field/Old/Old.shbd
+# Replace one file and remove another without downloading the old tree.
+chunker patch --bucket builds --prefix my-game/win \
+  --base-version 1.0.1 --version 1.0.2 \
+  --override assets/world.json=./world.json --remove assets/old.json
 ```
 
-### When to use `patch`
+`--override MANIFEST_PATH=LOCAL_FILE` and `--remove MANIFEST_PATH` can be repeated.
+An override can add a new file. A removal must name a file in the base manifest.
+Duplicate paths and overlapping overrides/removals are rejected.
 
-`release` re-hashes the entire content tree on every publish, which
-requires the full tree (multi-GB for game content) on the runner. For
-the common case of a tiny edit — one row in a data file, one map
-binary, one script — the cost is wildly disproportionate to the change.
+Chunk size defaults to 4 MiB; zstd level defaults to 12. `--chunk-size` accepts
+1 byte through 64 MiB. Patches must use the base manifest's chunk size. Upload
+concurrency defaults to 16 and accepts 1–64. New patch chunks are staged in a
+temporary directory, so their compressed contents do not all stay in memory.
+`release` removes its automatically created working directory on success or
+failure; a supplied `--work-dir` is retained.
 
-`patch` starts from the previously-published manifest in R2 instead.
-Override files are chunked locally, deltas land in the shared pool,
-and a new manifest is composed by overlaying the changes onto the
-base. The full tree never has to exist locally; the runner only needs
-the override files themselves.
+Run `chunker <command> --help` for the full option list.
 
-Output is byte-equivalent to what a full re-chunk would have produced
-had its input tree contained the same overlaid state.
+## Credentials
 
-#### Safety discipline
+Publishing uses `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`, falling back to
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Set `R2_ACCOUNT_ID` for R2, or
+`AWS_ENDPOINT_URL` for another S3 endpoint. `AWS_REGION` defaults to `auto`.
+Credentials are read from the environment and are not written to output files.
 
-- `latest.txt` is read at start and compared to `--base-version` (or
-  used as the implicit base). A mismatch aborts the patch — pass
-  `--allow-stale-base` to override if you genuinely want a stale-base
-  fork.
-- Refuses to publish over an existing target-version manifest unless
-  `--force` is set.
-- `--chunk-size` is validated against the base manifest's chunk size;
-  patches across different chunk sizes are rejected (they would not
-  share chunk boundaries with the existing pool).
-- Override paths and removal paths are validated locally before any
-  network call. Local file existence is checked up front. Failing
-  before opening the S3 client keeps half-applied state off the table.
-- Chunks are uploaded first, then the new manifest, then `latest.txt`
-  flips last — and only after a HEAD confirms the manifest is
-  observable. Any failure before the flip leaves the previous
-  `latest.txt` value intact.
+The storage service must support conditional `PutObject` requests with
+`If-Match` and `If-None-Match`. [Cloudflare R2 supports both](https://developers.cloudflare.com/r2/api/s3/api/).
 
-#### `--override` syntax
+## Validation and publication
 
-`--override MANIFEST_PATH=LOCAL_FILE`, repeatable. The manifest path
-is exactly the key as it appears in `manifest.files` — forward
-slashes, no leading slash, relative to the content root. Example:
-`resmap/field/Hub/Hub.shbd=/tmp/Hub.shbd` replaces the chunks for
-`resmap/field/Hub/Hub.shbd` in the new manifest with the chunks of
-`/tmp/Hub.shbd`.
+Chunker rejects missing or unreadable input, symlinks, unsafe paths, path
+collisions, invalid manifests, missing chunks, corrupt compressed data, and
+version mismatches. Paths use `/`, cannot escape the content root, and must be
+compatible with Windows filenames. OS metadata files such as `.DS_Store` and
+AppleDouble files are excluded.
 
-Adding an entirely new file (no entry in the base) works the same
-way — the path is inserted rather than replaced.
+Before publication, local chunks are decompressed with a size limit and checked
+against their SHA-256 hashes. Existing chunks are never overwritten. If another
+zstd configuration produced the same raw content, Chunker verifies and reuses the
+stored encoding and records its compressed size in the new manifest.
 
-#### `--remove` syntax
+Chunks are published first. Every referenced chunk, including inherited patch
+chunks, must exist with the expected size. Chunker then writes a new version
+manifest, reads it back, and compares its bytes before updating `latest.txt`.
+That final update uses the ETag read at the start. If another publisher changed
+the pointer, the update fails and preserves the other publisher's value.
+An interrupted or competing publication may leave unused chunks or an inactive
+version manifest; retry with a new version identifier.
 
-`--remove MANIFEST_PATH`, repeatable. The path must already exist in
-the base manifest (otherwise the patch aborts before any network
-calls). Removed paths are dropped from the new manifest's `files`
-map; their chunks stay in the shared pool but are pruned from this
-manifest's `chunks` index if no other file references them.
+Published version manifests cannot be overwritten. The old `--force` option is
+rejected. `--allow-stale-base` permits an intentional fork from an older base,
+but still checks for a competing pointer update during publication.
 
-## Environment
+Patches validate the base manifest and check inherited object sizes without
+redownloading the old content. The bucket and base publication are trusted.
+Chunker does not sign releases, authenticate users, or install files. Publishers
+own signing and release policy; installers must verify that authority and the
+bytes they download. SHA-256 checks alone do not authenticate a publisher.
 
-`publish` and `release` read S3 credentials from environment:
+## Storage format
 
-- `R2_ACCOUNT_ID` — Cloudflare account id (32 hex chars). For non-R2 S3
-  endpoints, leave unset and use `AWS_ENDPOINT_URL`.
-- `R2_ACCESS_KEY_ID`
-- `R2_SECRET_ACCESS_KEY`
-
-Equivalent `AWS_*` envs are also accepted; if both are present, `R2_*`
-wins.
-
-## Output layout
-
-After `chunker chunk --output ./out`:
-
-```
-out/
-├── manifest.json
-└── chunks/
-    └── <sha256>.zst
+```text
+<prefix>/chunks/<sha256>.zst
+<prefix>/versions/<version>/manifest.json
+<prefix>/latest.txt
 ```
 
-After `chunker publish` to bucket `B` with prefix `P`:
+The local `chunk` output contains `chunks/` and `manifest.json`. Each manifest
+stores `version`, `gameId`, `platform`, `generatedAt`, `chunkSize`, `totalSize`,
+`files` and `chunks`. File entries contain a byte `size` and an ordered list of
+chunk hashes; chunk entries contain `size`, `compressedSize` and the relative
+URL `../../chunks/<sha256>.zst`. Empty files have size zero and no chunks.
+Concatenating a file's decompressed chunks reconstructs its original bytes.
+The manifest format is unchanged in 0.2.1.
 
-```
-B/
-├── P/versions/<version>/manifest.json   (immutable per release)
-├── P/chunks/<sha256>.zst                (shared content-addressed pool)
-└── P/latest.txt                         (flipped last, after HEAD-verifying the manifest landed)
+## Development and releases
+
+Tests require Python 3.11+ in addition to Rust. They use synthetic files and a
+loopback S3 fixture with fake credentials; no R2 account is needed.
+
+```sh
+bash scripts/check.sh
 ```
 
-## Manifest format
+This runs rustfmt, Clippy, a release build, Rust unit tests, and CLI regressions.
+CI runs the same checks on Linux, Windows and macOS. Dependencies are resolved
+from `Cargo.lock`, and workflow actions are pinned to commits.
 
-```json
-{
-  "version": "1.0.2",
-  "gameId": "my-game",
-  "platform": "win",
-  "generatedAt": "2026-05-06T14:30:00.000Z",
-  "chunkSize": 4194304,
-  "totalSize": 5644321870,
-  "files": {
-    "assets/data/example.bin": {
-      "size": 5702864,
-      "chunks": ["a1b2…", "c3d4…"]
-    }
-  },
-  "chunks": {
-    "a1b2…": {
-      "size": 4194304,
-      "compressedSize": 2103456,
-      "url": "../../chunks/a1b2….zst"
-    }
-  }
-}
-```
+To release, update `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md`, merge the change,
+then push the matching `vX.Y.Z` tag. The release workflow creates a draft, tests
+and uploads all three executables and their checksums, then publishes only when
+all platforms pass. A failed run leaves the draft unpublished. A manual retry
+must select the same version tag; already public releases are not overwritten.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

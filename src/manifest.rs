@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
     #[serde(rename = "gameId")]
@@ -27,7 +27,7 @@ pub struct Manifest {
     pub chunks: BTreeMap<String, ChunkEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileEntry {
     pub size: u64,
     /// Ordered list of chunk hashes. Concatenating the decompressed
@@ -35,7 +35,7 @@ pub struct FileEntry {
     pub chunks: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkEntry {
     /// Uncompressed size in bytes.
     pub size: u64,
