@@ -78,7 +78,8 @@ jobs:
         shell: bash
         env:
           EXPECTED_TARGET: ${{ matrix.target }}
-        run: rustc -vV | grep -Fx "host: $EXPECTED_TARGET"
+        run: |
+          rustc -vV | grep -Fx "host: $EXPECTED_TARGET"
       - name: Check format, lint, build and regression tests
         shell: bash
         run: bash scripts/check.sh

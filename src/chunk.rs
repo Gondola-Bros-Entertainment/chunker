@@ -1,4 +1,5 @@
 //! Split regular files into SHA-256-addressed zstd chunks.
+use crate::manifest::{ChunkEntry, FileEntry, Manifest};
 use crate::validation;
 use anyhow::{Context, Result, ensure};
 use indicatif::{ProgressBar, ProgressStyle};
