@@ -2,7 +2,7 @@
 name = "chunker"
 version = "0.2.1"
 edition = "2024"
-description = "Cross-platform CDN content chunker — chunk + publish versioned content to S3-compatible storage"
+description = "Split files into compressed chunks and publish incremental updates to S3 or Cloudflare R2"
 license = "MIT"
 repository = "https://github.com/Gondola-Bros-Entertainment/chunker"
 readme = "README.md"

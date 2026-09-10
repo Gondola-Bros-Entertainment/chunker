@@ -24,11 +24,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Chunk a directory into content-addressed pieces + manifest.
+    /// Split a directory into content-addressed chunks and a manifest.
     Chunk(ChunkArgs),
-    /// Publish a previously-chunked output dir to S3-compatible storage.
+    /// Publish existing chunks and a manifest to S3-compatible storage.
     Publish(PublishArgs),
-    /// Chunk + publish in one pass.
+    /// Chunk and publish a directory in one command.
     Release(ReleaseArgs),
     /// Patch a published version with a small set of overrides /
     /// removals. Starts from a base manifest in R2 instead of walking
@@ -88,10 +88,10 @@ struct PublishArgs {
 
 #[derive(clap::Args)]
 struct ReleaseArgs {
-    /// Source directory to chunk + publish.
+    /// Source directory to chunk and publish.
     #[arg(long)]
     input: PathBuf,
-    /// Version string for both the manifest and the `latest.txt` flip.
+    /// Version recorded in the manifest and `latest.txt`.
     #[arg(long)]
     version: String,
     /// Game / app identifier.
@@ -115,8 +115,8 @@ struct ReleaseArgs {
     /// Concurrent chunk uploads (default 16).
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
-    /// Optional working directory for chunk output (default: a temp dir
-    /// that's removed on success).
+    /// Optional working directory for chunk output. The default temporary
+    /// directory is removed when the command finishes.
     #[arg(long)]
     work_dir: Option<PathBuf>,
 }
@@ -149,8 +149,7 @@ struct PatchArgs {
     #[arg(long = "remove")]
     removes: Vec<String>,
     /// Chunk size in bytes (default 4 MiB). Must match the base
-    /// manifest's chunk size — different sizes produce different chunk
-    /// boundaries and would not share the chunk pool.
+    /// manifest's chunk size to preserve chunk boundaries and reuse content.
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: u64,
     /// zstd compression level (default 12).
