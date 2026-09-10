@@ -222,8 +222,8 @@ class CliTests(unittest.TestCase):
 
     def test_missing_inherited_chunk_preserves_pointer(self):
         self.publish()
-        key = next(key for key in self.store.objects if '/chunks/' in key)
-        del self.store.objects[key]
+        inherited = hashlib.sha256(b'abcdefgh').hexdigest()
+        del self.store.objects[f'client/chunks/{inherited}.zst']
         self.patch(success=False)
         self.assertEqual(self.pointer(), b'v1\n')
 
