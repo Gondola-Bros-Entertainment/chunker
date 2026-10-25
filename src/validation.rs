@@ -242,7 +242,7 @@ mod tests {
         for name in [
             "assets/Hello world.bin",
             "日本語/é.bin",
-            "Orivella.app/Contents/MacOS/Orivella",
+            "Game.app/Contents/MacOS/Game",
         ] {
             relative_path(name).unwrap();
         }
