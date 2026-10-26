@@ -114,7 +114,6 @@ stores `version`, `gameId`, `platform`, `generatedAt`, `chunkSize`, `totalSize`,
 chunk hashes; chunk entries contain `size`, `compressedSize` and the relative
 URL `../../chunks/<sha256>.zst`. Empty files have size zero and no chunks.
 Concatenating a file's decompressed chunks reconstructs its original bytes.
-The manifest format is unchanged in 0.2.1.
 
 ## Development and releases
 
