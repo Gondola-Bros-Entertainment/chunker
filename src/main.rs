@@ -221,7 +221,7 @@ async fn run_release(args: ReleaseArgs) -> anyhow::Result<()> {
     validation::relative_path(&args.prefix)?;
     validation::concurrency(args.concurrency)?;
     let temporary = if args.work_dir.is_none() {
-        Some(temporary::Directory::new()?)
+        Some(temporary::directory()?)
     } else {
         None
     };
