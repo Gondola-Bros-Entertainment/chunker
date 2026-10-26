@@ -131,10 +131,25 @@ from `Cargo.lock`, and workflow actions are pinned to commits.
 
 To release, update `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md`, merge the change,
 then push the matching `vX.Y.Z` tag. The release workflow creates a draft, tests
-and uploads all three executables and their checksums, then publishes only when
-all platforms pass. A failed run leaves the draft unpublished. A manual retry
-must select the same version tag; already public releases are not overwritten.
+and uploads all three executables and their checksums, uploads
+`THIRD-PARTY-NOTICES` and its checksum, then publishes only when every job
+passes. A failed run leaves the draft unpublished. A manual retry must select
+the same version tag; already public releases are not overwritten.
+
+`scripts/notices.py` writes `THIRD-PARTY-NOTICES`: the licenses of the crates in
+`Cargo.lock`, gathered by cargo-about as configured in `about.toml`, then the
+notices that the installed Rust toolchain ships for its standard library. It
+fails when `about.toml` does not accept a dependency's license, or when
+cargo-about finds no license file for a dependency and would substitute the
+generic license text, which is allowed only for Apache-2.0. To check a
+dependency change before tagging, install cargo-about with the command in
+`.github/workflows/release.yml`, then run:
+
+```sh
+python3 scripts/notices.py THIRD-PARTY-NOTICES
+```
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The executables also include third-party software,
+listed with its licenses in each release's `THIRD-PARTY-NOTICES`.

@@ -110,8 +110,35 @@ jobs:
           ASSET: ${{ matrix.asset }}
         shell: bash
         run: gh release upload "$RELEASE_TAG" "$ASSET" "$ASSET.sha256" --clobber
+  notices:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The standard library notices come from this toolchain, installed from
+      # the same channel as the build jobs' toolchain.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # The cargo-about binary is gated behind the cli feature.
+      - name: Install cargo-about
+        run: cargo install --locked --features cli cargo-about@0.9.2
+      - name: Generate third-party notices and checksum
+        run: |
+          python3 scripts/notices.py THIRD-PARTY-NOTICES
+          sha256sum THIRD-PARTY-NOTICES > THIRD-PARTY-NOTICES.sha256
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" THIRD-PARTY-NOTICES THIRD-PARTY-NOTICES.sha256 --clobber
   publish:
-    needs: [prepare, build]
+    needs: [prepare, build, notices]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -127,7 +154,7 @@ jobs:
           python3 - <<'PY'
           import json
           state = json.load(open('release-state.json'))
-          names = {'chunker-linux-x64', 'chunker-windows-x64.exe', 'chunker-macos-arm64'}
+          names = {'chunker-linux-x64', 'chunker-windows-x64.exe', 'chunker-macos-arm64', 'THIRD-PARTY-NOTICES'}
           expected = names | {name + '.sha256' for name in names}
           assert state['isDraft'] and {a['name'] for a in state['assets']} == expected
           assert all(a['size'] > 0 for a in state['assets'])
