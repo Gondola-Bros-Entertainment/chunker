@@ -6,4 +6,4 @@ cargo build --release --locked
 cargo test --release --locked
 binary=target/release/chunker
 if [[ "${OS:-}" == Windows_NT ]]; then binary+=.exe; fi
-python tests/cli.py "$binary"
+"${PYTHON:-python3}" tests/cli.py "$binary"

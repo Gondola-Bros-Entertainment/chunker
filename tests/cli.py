@@ -15,6 +15,7 @@ import urllib.parse
 
 BINARY = str(Path(sys.argv.pop(1)).resolve())
 
+
 class Store(http.server.ThreadingHTTPServer):
     def __init__(self):
         super().__init__(('127.0.0.1', 0), Handler)
@@ -25,8 +26,10 @@ class Store(http.server.ThreadingHTTPServer):
         self.race_manifest = False
         self.lock = threading.Lock()
 
+
 def etag(body):
     return '"' + hashlib.md5(body).hexdigest() + '"'
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
@@ -92,6 +95,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if self.server.corrupt_manifest:
                     self.server.objects[key] = b'{}'
             self.reply(200)
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -216,7 +220,8 @@ class CliTests(unittest.TestCase):
         self.chunk(output=full, version='v2')
         actual = json.loads(self.store.objects['client/versions/v2/manifest.json'])
         expected = json.loads(full.joinpath('manifest.json').read_text())
-        actual.pop('generatedAt'); expected.pop('generatedAt')
+        actual.pop('generatedAt')
+        expected.pop('generatedAt')
         self.assertEqual(actual, expected)
         self.assertEqual(self.pointer(), b'v2\n')
 
@@ -262,6 +267,7 @@ class CliTests(unittest.TestCase):
             canonical = before[hash_ + '.zst']
             self.assertEqual(self.store.objects[f'client/chunks/{hash_}.zst'], canonical)
             self.assertEqual(chunk['compressedSize'], len(canonical))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

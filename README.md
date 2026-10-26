@@ -118,7 +118,7 @@ The manifest format is unchanged in 0.2.1.
 
 ## Development and releases
 
-Tests require Python 3.11+ in addition to Rust. They use synthetic files and a
+Tests require Python 3 in addition to Rust. They use synthetic files and a
 loopback S3 fixture with fake credentials; no R2 account is needed.
 
 ```sh
@@ -126,6 +126,7 @@ bash scripts/check.sh
 ```
 
 This runs rustfmt, Clippy, a release build, Rust unit tests, and CLI regressions.
+The CLI regressions run with `python3`; set `PYTHON` to use another interpreter.
 CI runs the same checks on Linux, Windows and macOS. Dependencies are resolved
 from `Cargo.lock`, and workflow actions are pinned to commits.
 
