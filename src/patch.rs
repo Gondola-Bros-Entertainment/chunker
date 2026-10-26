@@ -115,7 +115,7 @@ pub async fn patch(opts: &PatchOpts) -> Result<()> {
         "version manifest already exists; choose a new version"
     );
     let condition = Condition::Absent;
-    let staging = temporary::Directory::new()?;
+    let staging = temporary::directory()?;
     let (manifest, pending) = build_manifest(opts, manifest, staging.path())?;
     publish::publish_manifest(
         &client,
