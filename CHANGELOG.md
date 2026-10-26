@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Chunk `patch` overrides at the base manifest's chunk size. `patch` no longer
+  accepts `--chunk-size`.
+- Remove the hidden `--force` option from `patch`. Passing it now fails as an
+  unknown argument with exit code 2 instead of 1.
+
 ## 0.2.1
 
 - Validate paths, manifests and local chunk contents before publication. Reject

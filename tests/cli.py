@@ -142,7 +142,7 @@ class CliTests(unittest.TestCase):
         replacement = self.root / 'replacement'
         replacement.write_bytes(b'abcdefgh')
         return self.run_cli(['patch', '--bucket', 'audit', '--prefix', 'client', '--base-version', 'v1',
-                             '--version', 'v2', '--chunk-size', '8', '--override', f'data.bin={replacement}', *extra], success)
+                             '--version', 'v2', '--override', f'data.bin={replacement}', *extra], success)
 
     def pointer(self):
         return self.store.objects.get('client/latest.txt')
@@ -194,11 +194,10 @@ class CliTests(unittest.TestCase):
         self.publish(success=False, extra=['--concurrency', '0'])
         self.assertFalse(self.store.requests)
 
-    def test_patch_preflight_paths_conflicts_and_force(self):
+    def test_patch_preflight_paths_and_conflicts(self):
         replacement = self.root / 'other'
         replacement.write_bytes(b'x')
-        for args in [['--override', f'../escape={replacement}'], ['--remove', 'data.bin'],
-                     ['--remove', '../escape'], ['--force']]:
+        for args in [['--override', f'../escape={replacement}'], ['--remove', 'data.bin'], ['--remove', '../escape']]:
             self.patch(args, success=False)
         self.assertFalse(self.store.requests)
 
@@ -212,7 +211,7 @@ class CliTests(unittest.TestCase):
         self.publish()
         replacement = self.root / 'replacement'
         replacement.write_bytes(b'abcdefghABCDEFGHABC')
-        self.run_cli(['patch', '--bucket', 'audit', '--prefix', 'client', '--version', 'v2', '--chunk-size', '8',
+        self.run_cli(['patch', '--bucket', 'audit', '--prefix', 'client', '--version', 'v2',
                       '--override', f'data.bin={replacement}', '--remove', 'empty'])
         self.source.joinpath('data.bin').write_bytes(replacement.read_bytes())
         self.source.joinpath('empty').unlink()

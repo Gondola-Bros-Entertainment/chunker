@@ -51,7 +51,7 @@ An override can add a new file. A removal must name a file in the base manifest.
 Duplicate paths and overlapping overrides/removals are rejected.
 
 Chunk size defaults to 4 MiB; zstd level defaults to 12. `--chunk-size` accepts
-1 byte through 64 MiB. Patches must use the base manifest's chunk size. Upload
+1 byte through 64 MiB. Patches reuse the base manifest's chunk size. Upload
 concurrency defaults to 16 and accepts 1 to 64. New patch chunks are staged in a
 temporary directory, so their compressed contents do not all stay in memory.
 `release` removes its automatically created working directory on success or
@@ -90,9 +90,9 @@ the pointer, the update fails and preserves the other publisher's value.
 An interrupted or competing publication may leave unused chunks or an inactive
 version manifest; retry with a new version identifier.
 
-Published version manifests cannot be overwritten. The old `--force` option is
-rejected. `--allow-stale-base` permits an intentional fork from an older base,
-but still checks for a competing pointer update during publication.
+Published version manifests cannot be overwritten. `--allow-stale-base` permits
+an intentional fork from an older base, but still checks for a competing pointer
+update during publication.
 
 Patches validate the base manifest and check inherited object sizes without
 redownloading the old content. The bucket and base publication are trusted.
