@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 - Chunk `patch` overrides at the base manifest's chunk size. `patch` no longer
   accepts `--chunk-size`.
