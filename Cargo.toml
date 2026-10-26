@@ -5,9 +5,7 @@ edition = "2024"
 description = "Split files into compressed chunks and publish incremental updates to S3 or Cloudflare R2"
 license = "MIT"
 repository = "https://github.com/Gondola-Bros-Entertainment/chunker"
-readme = "README.md"
-keywords = ["cdn", "chunker", "s3", "r2", "content-delivery"]
-categories = ["command-line-utilities"]
+publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
