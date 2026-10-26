@@ -6,6 +6,10 @@
   accepts `--chunk-size`.
 - Remove the hidden `--force` option from `patch`. Passing it now fails as an
   unknown argument with exit code 2 instead of 1.
+- Publish `THIRD-PARTY-NOTICES` and its checksum with the executables. It
+  carries the license and copyright notices of the crates and bundled C
+  libraries built into them, and the notices that the Rust toolchain ships for
+  its standard library.
 
 ## 0.2.1
 
