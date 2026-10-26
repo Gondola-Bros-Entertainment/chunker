@@ -47,7 +47,7 @@ pub async fn publish(opts: &PublishOpts) -> Result<()> {
         files.insert(hash.clone(), file);
     }
     // No network writes are possible before every source chunk has passed validation.
-    let client = r2::build_client().await?;
+    let client = r2::build_client()?;
     let previous = r2::get(
         &client,
         &opts.bucket,

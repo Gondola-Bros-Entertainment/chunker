@@ -5,7 +5,7 @@ use aws_sdk_s3::{Client, config::Credentials, primitives::ByteStream};
 pub const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 pub const NO_CACHE: &str = "public, max-age=0, must-revalidate";
 
-pub async fn build_client() -> Result<Client> {
+pub fn build_client() -> Result<Client> {
     let first = |names: &[&str]| {
         names
             .iter()
@@ -98,7 +98,7 @@ impl Condition {
     }
 }
 
-// false means another writer changed the object. Never retry unconditionally.
+/// Return false when another writer changed the object. Never retry unconditionally.
 pub async fn put(
     client: &Client,
     bucket: &str,

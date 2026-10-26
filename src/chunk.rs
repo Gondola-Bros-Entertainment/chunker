@@ -2,7 +2,7 @@
 use crate::manifest::{ChunkEntry, FileEntry, Manifest};
 use crate::validation;
 use anyhow::{Context, Result, ensure};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, create_dir_all, write};
@@ -86,10 +86,10 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
         .with_context(|| format!("create output chunks dir at {}", chunks_dir.display()))?;
 
     println!(
-        "chunker: input={} output={} chunk_size={} MiB zstd={}",
+        "chunker: input={} output={} chunk_size={} zstd={}",
         opts.input.display(),
         opts.output.display(),
-        opts.chunk_size / (1024 * 1024),
+        HumanBytes(opts.chunk_size),
         opts.zstd_level
     );
 
@@ -142,7 +142,6 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
                 Ok(())
             })?;
 
-        validation::relative_path(&rel_path)?;
         total_size = total_size
             .checked_add(file_size)
             .context("input total size overflow")?;
@@ -155,7 +154,7 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
         );
         pb.inc(1);
     }
-    pb.finish_with_message("chunked");
+    pb.finish();
 
     let manifest = Manifest {
         version: opts.version.clone(),
@@ -189,7 +188,7 @@ pub fn chunk(opts: &ChunkOpts) -> Result<()> {
 }
 
 /// Sort regular files for deterministic manifests. Propagate traversal errors.
-fn collect_files(root: &PathBuf) -> Result<Vec<PathBuf>> {
+fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in WalkDir::new(root) {
         let entry = entry.context("read input tree")?;

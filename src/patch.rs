@@ -65,7 +65,7 @@ fn preflight(opts: &PatchOpts) -> Result<()> {
 
 pub async fn patch(opts: &PatchOpts) -> Result<()> {
     preflight(opts)?;
-    let client = r2::build_client().await?;
+    let client = r2::build_client()?;
     let prior = r2::get(
         &client,
         &opts.bucket,
