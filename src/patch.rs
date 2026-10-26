@@ -24,24 +24,17 @@ pub struct PatchOpts {
     pub new_version: String,
     pub overrides: Vec<Override>,
     pub removes: Vec<String>,
-    pub chunk_size: u64,
     pub zstd_level: i32,
     pub concurrency: usize,
-    pub force: bool,
     pub allow_stale_base: bool,
 }
 
 fn preflight(opts: &PatchOpts) -> Result<()> {
-    ensure!(
-        !opts.force,
-        "overwriting version manifests is no longer supported; choose a new version"
-    );
     validation::identifier(&opts.new_version)?;
     if let Some(base) = &opts.base_version {
         validation::identifier(base)?;
     }
     validation::relative_path(&opts.prefix)?;
-    validation::chunk_size(opts.chunk_size)?;
     validation::concurrency(opts.concurrency)?;
     ensure!(
         !opts.overrides.is_empty() || !opts.removes.is_empty(),
@@ -105,10 +98,6 @@ pub async fn patch(opts: &PatchOpts) -> Result<()> {
         manifest.version == base,
         "base manifest version does not match its location"
     );
-    ensure!(
-        manifest.chunk_size == opts.chunk_size,
-        "chunk size does not match base manifest"
-    );
     for name in &opts.removes {
         ensure!(
             manifest.files.contains_key(name),
@@ -150,7 +139,7 @@ fn build_manifest(
 ) -> Result<(Manifest, BTreeMap<String, PathBuf>)> {
     let mut pending = BTreeMap::new();
     for replacement in &opts.overrides {
-        let (size, hashes) = for_each_chunk(&replacement.local, opts.chunk_size, |hash, raw| {
+        let (size, hashes) = for_each_chunk(&replacement.local, base.chunk_size, |hash, raw| {
             if !base.chunks.contains_key(hash) {
                 let bytes = zstd::encode_all(raw, opts.zstd_level)?;
                 let file = staging.join(format!("{hash}.zst"));

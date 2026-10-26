@@ -139,28 +139,21 @@ struct PatchArgs {
     #[arg(long)]
     version: String,
     /// File replacement: `<manifest-path>=<local-file>`. Repeatable.
-    /// The local file is chunked at the same `--chunk-size` as the base
-    /// manifest. Existing encodings are verified and reused. Manifest paths
-    /// use forward slashes and are relative to the content root.
+    /// The local file is chunked at the base manifest's chunk size.
+    /// Existing encodings are verified and reused. Manifest paths use
+    /// forward slashes and are relative to the content root.
     #[arg(long = "override", value_parser = parse_override)]
     overrides: Vec<patch::Override>,
     /// Manifest-relative path to remove from the new version.
     /// Repeatable. Must already be present in the base manifest.
     #[arg(long = "remove")]
     removes: Vec<String>,
-    /// Chunk size in bytes (default 4 MiB). Must match the base
-    /// manifest's chunk size to preserve chunk boundaries and reuse content.
-    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
-    chunk_size: u64,
     /// zstd compression level (default 12).
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
     /// Concurrent chunk uploads (default 16).
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
-    /// Retired: published versions cannot be overwritten. Use a new version.
-    #[arg(long, hide = true, default_value_t = false)]
-    force: bool,
     /// Proceed even when `--base-version` disagrees with the current
     /// `latest.txt`. The final pointer update still rejects concurrent changes.
     #[arg(long, default_value_t = false)]
@@ -264,10 +257,8 @@ async fn run_patch(args: PatchArgs) -> anyhow::Result<()> {
         new_version: args.version,
         overrides: args.overrides,
         removes: args.removes,
-        chunk_size: args.chunk_size,
         zstd_level: args.zstd_level,
         concurrency: args.concurrency,
-        force: args.force,
         allow_stale_base: args.allow_stale_base,
     })
     .await
