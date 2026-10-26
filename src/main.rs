@@ -30,10 +30,11 @@ enum Cmd {
     Publish(PublishArgs),
     /// Chunk and publish a directory in one command.
     Release(ReleaseArgs),
-    /// Patch a published version with a small set of overrides /
-    /// removals. Starts from a base manifest in R2 instead of walking
-    /// a local tree, so single-file edits do not require the full
-    /// content tree on the runner.
+    /// Publish a new version from a published base with file overrides and
+    /// removals.
+    ///
+    /// Reads the base manifest from storage instead of walking a local tree,
+    /// so single-file edits do not require the full content tree on the runner.
     Patch(PatchArgs),
 }
 
@@ -56,10 +57,10 @@ struct ChunkArgs {
     /// `linux`).
     #[arg(long)]
     platform: String,
-    /// Chunk size in bytes (default 4 MiB).
+    /// Chunk size in bytes.
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: u64,
-    /// zstd compression level (default 12).
+    /// zstd compression level.
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
 }
@@ -81,7 +82,7 @@ struct PublishArgs {
     /// Top-level prefix inside the bucket (e.g. `client`).
     #[arg(long)]
     prefix: String,
-    /// Concurrent chunk uploads (default 16).
+    /// Concurrent chunk uploads.
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
 }
@@ -106,13 +107,13 @@ struct ReleaseArgs {
     /// Top-level prefix.
     #[arg(long)]
     prefix: String,
-    /// Chunk size in bytes (default 4 MiB).
+    /// Chunk size in bytes.
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: u64,
-    /// zstd compression level (default 12).
+    /// zstd compression level.
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
-    /// Concurrent chunk uploads (default 16).
+    /// Concurrent chunk uploads.
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
     /// Optional working directory for chunk output. The default temporary
@@ -148,10 +149,10 @@ struct PatchArgs {
     /// Repeatable. Must already be present in the base manifest.
     #[arg(long = "remove")]
     removes: Vec<String>,
-    /// zstd compression level (default 12).
+    /// zstd compression level.
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     zstd_level: i32,
-    /// Concurrent chunk uploads (default 16).
+    /// Concurrent chunk uploads.
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: usize,
     /// Proceed even when `--base-version` disagrees with the current
